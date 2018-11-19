@@ -102,38 +102,64 @@ typedef struct buf_s {
     char buf[BUFSIZE];
     int n;
     list_t list;
-    enum FragmentationUnit unit_type;
-    enum FuHeader fu_header;
 } buf_t;
 
-int set_fragmentation_unit_type(buf_t* buf) {
+typedef struct bo_video_packet_s {
+    uint timestamp;
+    uint fec_group;
+    ushort fec_index;
+    ushort data_packets;
+    ushort total_packets;
+    char payload[1986];
+
+} bo_video_packet_t;
+
+enum FragmentationUnit get_fragmentation_unit_type(buf_t* buf) {
     switch (buf->buf[12] & 31) {
         case FRAG_UNIT_A:
-            buf->unit_type = A;
-            return 0;
+            return A;
         case FRAG_UNIT_B:
-            buf->unit_type = B;
-            return 0;
+            return B;
         case NON_IDR_UNIT:
-            buf->unit_type = A;
-            return 0;
+            return A;
         default:
             return -1;
     }
 }
 
-int set_fu_header_type(buf_t* buf) {
+enum FuHeader get_fu_header_type(buf_t* buf) {
     switch (buf->buf[13] & 192) {
         case FU_HEADER_START:
-            buf->fu_header = Start;
-            return 0;
+            return Start;
         case FU_HEADER_END:
-            buf->fu_header = End;
-            return 0;
+            return End;
         default:
-            buf->fu_header = Middle;
-            return 0;
+            return Middle;
     }
+}
+
+uint get_timestamp(const char* const buf) {
+    return (uint)buf[4] << 24 | (uint)buf[5] << 16 | (uint)buf[6] << 8 | (uint)buf[7];
+}
+
+void form_bo_video_packet(char* buf, uint fec_group, ushort fec_index, ushort data_packets, ushort total_packets) {
+    uint timestamp = get_timestamp(buf);
+    bo_video_packet_t* packet = (bo_video_packet_t*)buf;
+    packet->timestamp = timestamp;
+    packet->fec_group = fec_group;
+    packet->fec_index = fec_index;
+    packet->data_packets = data_packets;
+    packet->total_packets = total_packets;
+}
+
+void form_bo_video_packet_group(list_t* buf_list, uint* fec_group, int frame_buffer_end) {
+    ushort fec_index = 0;
+    for (list_t *elt = buf_list->next; elt != buf_list;) {
+        buf_t *buf_elt = list_elt(elt, buf_t, list);
+        elt = elt->next;
+        form_bo_video_packet(buf_elt->buf, *fec_group, fec_index++, frame_buffer_end, frame_buffer_end);
+    }
+    *fec_group = *fec_group + 1;
 }
 
 int udp_forward(int video_socket, int audio_socket, int public_video_socket, int public_audio_socket, int efd) {
@@ -147,6 +173,10 @@ int udp_forward(int video_socket, int audio_socket, int public_video_socket, int
     list_t buf_list;
     list_new(&buf_list);
     list_t frame_buf_list;
+    list_new(&frame_buf_list);
+    buf_t frame_buffer[200];
+    int frame_buffer_end = 0;
+    uint current_fec_group = 1;
 
     struct sockaddr_in video_clientaddr;
     int video_clientaddrlen = -1;
@@ -213,14 +243,55 @@ int udp_forward(int video_socket, int audio_socket, int public_video_socket, int
             } else if (fds[i].fd == video_socket) {
                 if (video_clientaddrlen == -1)
                     continue;
+                if (get_fragmentation_unit_type(&(buf_slab[buf_slab_end])) == B) {
+                    memcpy(&(frame_buffer[frame_buffer_end]), &(buf_slab[buf_slab_end]), sizeof(buf_t));
+                    enum FuHeader header = get_fu_header_type(&(frame_buffer[frame_buffer_end]));
+                    if (header == Start) {
+                        frame_buffer_end = 0;
+                        list_new(&frame_buf_list);
+                        list_add_tail(&(frame_buffer[frame_buffer_end].list), &frame_buf_list);
+
+                    } else if (header == Middle) {
+                        list_add_tail(&(frame_buffer[frame_buffer_end].list), &frame_buf_list);
+                        frame_buffer_end++;
+                        if (frame_buffer_end == 200) {
+                            frame_buffer_end = 0;
+                        }
+                        if (&(frame_buffer[frame_buffer_end].list) == &frame_buf_list) {
+                            log_debug("reached max list length, prune all members of a list");
+                            list_new(&frame_buf_list);
+                        }
+                    } else {
+                        //TODO: perform adding parity packets
+                        list_add_tail(&(frame_buffer[frame_buffer_end].list), &frame_buf_list);
+                        frame_buffer_end++;
+                        form_bo_video_packet_group(&frame_buf_list, &current_fec_group, frame_buffer_end);
+                        for (list_t *elt = frame_buf_list.next; elt != &frame_buf_list;) {
+                            buf_t *buf_elt = list_elt(elt, buf_t, list);
+                            elt = elt->next;
+                            list_del(&buf_elt->list);
+                            list_add_tail(&buf_elt->list, &buf_list);
+                            buf_slab_end++;
+                            if (buf_slab_end == BUFLISTSIZE) {
+                                buf_slab_end = 0;
+                            }
+                            if (&(buf_slab[buf_slab_end].list) == buf_list.next) {
+                                log_debug("reached max list length, prune all members of a list");
+                                list_new(&buf_list);
+                            }
+                        }
+                    }
+                }
                 if (tokens > 0) {
                     tokens--;
+                    form_bo_video_packet(buf, current_fec_group, 1, 1, 1);
                     if (sendto(public_video_socket, buf, *n, 0, (struct sockaddr *) &video_clientaddr, video_clientaddrlen) < 0)
                     error("video sendto");
                     if (tokens == 0) {
                         log_debug("reached 0 tokens");
                     }
                 } else {
+                    form_bo_video_packet(buf, current_fec_group, 1, 1, 1);
                     list_add_tail(&(buf_slab[buf_slab_end].list), &buf_list);
                     buf_slab_end++;
                     if (buf_slab_end == BUFLISTSIZE) {
