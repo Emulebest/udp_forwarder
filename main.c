@@ -15,6 +15,7 @@
 #include <pthread.h>
 #include <sys/eventfd.h>
 #include <time.h>
+#include "rs/rs.h"
 
 #define error(fmt, ...)       \
     {fprintf(stderr, "UdpForwarder %s:%d ERROR " fmt "\n", \
@@ -77,6 +78,7 @@ void list_del(list_t *p) {
 
 #define BUFSIZE 2000
 #define BUFLISTSIZE 300
+#define FRAMEBUFSIFE 200
 // 5 ms
 #define TOKENINTERVAL 1000000L
 // TOKENINTERVAL*MAXTOKENS = MBps
@@ -142,8 +144,11 @@ uint get_timestamp(const char* const buf) {
     return (uint)buf[4] << 24 | (uint)buf[5] << 16 | (uint)buf[6] << 8 | (uint)buf[7];
 }
 
-void form_bo_video_packet(char* buf, uint fec_group, ushort fec_index, ushort data_packets, ushort total_packets) {
-    uint timestamp = get_timestamp(buf);
+ushort get_sequence_number(const char* const buf) {
+    return (ushort)buf[2] << 8 | (ushort)buf[3];
+}
+
+void form_bo_video_packet(char* buf, uint fec_group, ushort fec_index, ushort data_packets, ushort total_packets, uint timestamp) {
     bo_video_packet_t* packet = (bo_video_packet_t*)buf;
     packet->timestamp = timestamp;
     packet->fec_group = fec_group;
@@ -153,13 +158,44 @@ void form_bo_video_packet(char* buf, uint fec_group, ushort fec_index, ushort da
 }
 
 void form_bo_video_packet_group(list_t* buf_list, uint* fec_group, int frame_buffer_end) {
+    buf_t *header = list_elt(buf_list->next, buf_t, list);
+    uint timestamp = get_timestamp(header->buf);
     ushort fec_index = 0;
     for (list_t *elt = buf_list->next; elt != buf_list;) {
         buf_t *buf_elt = list_elt(elt, buf_t, list);
         elt = elt->next;
-        form_bo_video_packet(buf_elt->buf, *fec_group, fec_index++, frame_buffer_end, frame_buffer_end);
+        form_bo_video_packet(buf_elt->buf, *fec_group, fec_index++, frame_buffer_end, frame_buffer_end, timestamp);
     }
     *fec_group = *fec_group + 1;
+}
+
+unsigned char** generate_parity(list_t* buf_list, int frame_buffer_end, int parity_amount) {
+    buf_t *header = list_elt(buf_list->next, buf_t, list);
+    int lowest_sequence_number = get_sequence_number(header->buf);
+    int total_packets = parity_amount + frame_buffer_end + 1;
+    unsigned char** packets = malloc(total_packets * (sizeof(unsigned char*)));
+    reed_solomon *rs = reed_solomon_new(frame_buffer_end, parity_amount);
+    for (list_t *elt = buf_list->next; elt != buf_list;) {
+        buf_t *buf_elt = list_elt(elt, buf_t, list);
+        elt = elt->next;
+        int sequence_idx = get_sequence_number(buf_elt->buf) - lowest_sequence_number;
+        packets[sequence_idx] = (unsigned char*) buf_elt->buf;
+    }
+    reed_solomon_encode(rs, packets, total_packets, BUFSIZE);
+    reed_solomon_release(rs);
+    return packets + frame_buffer_end;
+}
+
+void queue_parity(unsigned char** parity, list_t* buf_list, int total_parity_length, buf_t* frame_buf, int* frame_buffer_end) {
+    for (int i = 0; i < total_parity_length; i++) {
+        buf_t parity_packet;
+        memcpy(parity_packet.buf, parity[i], 1084);
+        parity_packet.n = 1084;
+        *frame_buffer_end = *frame_buffer_end + 1;
+        list_add_tail(&(frame_buf[*frame_buffer_end].list), buf_list);
+        free(parity[i]);
+    }
+    free(parity);
 }
 
 int udp_forward(int video_socket, int audio_socket, int public_video_socket, int public_audio_socket, int efd) {
@@ -174,7 +210,7 @@ int udp_forward(int video_socket, int audio_socket, int public_video_socket, int
     list_new(&buf_list);
     list_t frame_buf_list;
     list_new(&frame_buf_list);
-    buf_t frame_buffer[200];
+    buf_t frame_buffer[FRAMEBUFSIFE];
     int frame_buffer_end = 0;
     uint current_fec_group = 1;
 
@@ -254,7 +290,7 @@ int udp_forward(int video_socket, int audio_socket, int public_video_socket, int
                     } else if (header == Middle) {
                         list_add_tail(&(frame_buffer[frame_buffer_end].list), &frame_buf_list);
                         frame_buffer_end++;
-                        if (frame_buffer_end == 200) {
+                        if (frame_buffer_end == FRAMEBUFSIFE) {
                             frame_buffer_end = 0;
                         }
                         if (&(frame_buffer[frame_buffer_end].list) == &frame_buf_list) {
@@ -262,9 +298,11 @@ int udp_forward(int video_socket, int audio_socket, int public_video_socket, int
                             list_new(&frame_buf_list);
                         }
                     } else {
-                        //TODO: perform adding parity packets
                         list_add_tail(&(frame_buffer[frame_buffer_end].list), &frame_buf_list);
                         frame_buffer_end++;
+                        int parity_amount = (frame_buffer_end + 1 / 10) * 2;
+                        unsigned char** parity_packets = generate_parity(&frame_buf_list, frame_buffer_end, parity_amount);
+                        queue_parity(parity_packets, &frame_buf_list, parity_amount, (buf_t*)&frame_buffer, &frame_buffer_end);
                         form_bo_video_packet_group(&frame_buf_list, &current_fec_group, frame_buffer_end);
                         for (list_t *elt = frame_buf_list.next; elt != &frame_buf_list;) {
                             buf_t *buf_elt = list_elt(elt, buf_t, list);
@@ -284,14 +322,14 @@ int udp_forward(int video_socket, int audio_socket, int public_video_socket, int
                 }
                 if (tokens > 0) {
                     tokens--;
-                    form_bo_video_packet(buf, current_fec_group, 1, 1, 1);
+                    form_bo_video_packet(buf, current_fec_group, 1, 1, 1, get_timestamp(buf));
                     if (sendto(public_video_socket, buf, *n, 0, (struct sockaddr *) &video_clientaddr, video_clientaddrlen) < 0)
                     error("video sendto");
                     if (tokens == 0) {
                         log_debug("reached 0 tokens");
                     }
                 } else {
-                    form_bo_video_packet(buf, current_fec_group, 1, 1, 1);
+                    form_bo_video_packet(buf, current_fec_group, 1, 1, 1, get_timestamp(buf));
                     list_add_tail(&(buf_slab[buf_slab_end].list), &buf_list);
                     buf_slab_end++;
                     if (buf_slab_end == BUFLISTSIZE) {
@@ -396,6 +434,7 @@ int create_udp_server_socket(int port) {
 }
 
 int main_(int video_port, int audio_port, int public_video_port, int public_audio_port) {
+    reed_solomon_init();
     int video_socket = 0;
     int audio_socket = 0;
     int public_video_socket = 0;
