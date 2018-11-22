@@ -172,7 +172,7 @@ void form_bo_video_packet_group(list_t* buf_list, uint* fec_group, int frame_buf
 unsigned char** generate_parity(list_t* buf_list, int frame_buffer_end, int parity_amount) {
     buf_t *header = list_elt(buf_list->next, buf_t, list);
     int lowest_sequence_number = get_sequence_number(header->buf);
-    int total_packets = parity_amount + frame_buffer_end + 1;
+    int total_packets = parity_amount + frame_buffer_end;
     unsigned char** packets = malloc(total_packets * (sizeof(unsigned char*)));
     reed_solomon *rs = reed_solomon_new(frame_buffer_end, parity_amount);
     for (list_t *elt = buf_list->next; elt != buf_list;) {
@@ -180,6 +180,9 @@ unsigned char** generate_parity(list_t* buf_list, int frame_buffer_end, int pari
         elt = elt->next;
         int sequence_idx = get_sequence_number(buf_elt->buf) - lowest_sequence_number;
         packets[sequence_idx] = (unsigned char*) buf_elt->buf;
+    }
+    for (int i = frame_buffer_end; i < total_packets; i++) {
+        packets[i] = (unsigned char*) malloc(sizeof(char) * BUFSIZE);
     }
     reed_solomon_encode(rs, packets, total_packets, BUFSIZE);
     reed_solomon_release(rs);
@@ -195,7 +198,6 @@ void queue_parity(unsigned char** parity, list_t* buf_list, int total_parity_len
         list_add_tail(&(frame_buf[*frame_buffer_end].list), buf_list);
         free(parity[i]);
     }
-    free(parity);
 }
 
 int udp_forward(int video_socket, int audio_socket, int public_video_socket, int public_audio_socket, int efd) {
@@ -300,7 +302,7 @@ int udp_forward(int video_socket, int audio_socket, int public_video_socket, int
                     } else {
                         list_add_tail(&(frame_buffer[frame_buffer_end].list), &frame_buf_list);
                         frame_buffer_end++;
-                        int parity_amount = (frame_buffer_end + 1 / 10) * 2;
+                        int parity_amount = ((frame_buffer_end + 1) / 10) * 2;
                         unsigned char** parity_packets = generate_parity(&frame_buf_list, frame_buffer_end, parity_amount);
                         queue_parity(parity_packets, &frame_buf_list, parity_amount, (buf_t*)&frame_buffer, &frame_buffer_end);
                         form_bo_video_packet_group(&frame_buf_list, &current_fec_group, frame_buffer_end);
