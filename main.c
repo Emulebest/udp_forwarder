@@ -141,13 +141,13 @@ enum FuHeader get_fu_header_type(buf_t* buf) {
 }
 
 uint get_timestamp(const char* const buf) {
-    return (uint)buf[4] << 24 | (uint)buf[5] << 16 | (uint)buf[6] << 8 | (uint)buf[7];
+    return (unsigned char)buf[4] << 24 | (unsigned char)buf[5] << 16 | (unsigned char)buf[6] << 8 | (unsigned char)buf[7];
 }
 
 ushort get_sequence_number(const char* const buf) {
-    return (ushort)buf[2] << 8 | (ushort)buf[3];
+    ushort sequence_num = (unsigned char)buf[2] << 8 | (unsigned char)buf[3];
+    return sequence_num;
 }
-
 void form_bo_video_packet(char* buf, uint fec_group, ushort fec_index, ushort data_packets, ushort total_packets, uint timestamp) {
     bo_video_packet_t* packet = (bo_video_packet_t*)buf;
     packet->timestamp = timestamp;
@@ -178,7 +178,8 @@ unsigned char** generate_parity(list_t* buf_list, int frame_buffer_end, int pari
     for (list_t *elt = buf_list->next; elt != buf_list;) {
         buf_t *buf_elt = list_elt(elt, buf_t, list);
         elt = elt->next;
-        int sequence_idx = get_sequence_number(buf_elt->buf) - lowest_sequence_number;
+        int sequence_num = get_sequence_number(buf_elt->buf);
+        int sequence_idx = sequence_num - lowest_sequence_number;
         packets[sequence_idx] = (unsigned char*) buf_elt->buf;
     }
     for (int i = frame_buffer_end; i < total_packets; i++) {
@@ -192,9 +193,10 @@ unsigned char** generate_parity(list_t* buf_list, int frame_buffer_end, int pari
 void queue_parity(unsigned char** parity, list_t* buf_list, int total_parity_length, buf_t* frame_buf, int* frame_buffer_end) {
     for (int i = 0; i < total_parity_length; i++) {
         buf_t parity_packet;
-        memcpy(parity_packet.buf, parity[i], 1084);
-        parity_packet.n = 1084;
+        memcpy(parity_packet.buf, parity[i], 1041);
+        parity_packet.n = 1041;
         *frame_buffer_end = *frame_buffer_end + 1;
+        frame_buf[*frame_buffer_end] = parity_packet;
         list_add_tail(&(frame_buf[*frame_buffer_end].list), buf_list);
         free(parity[i]);
     }
