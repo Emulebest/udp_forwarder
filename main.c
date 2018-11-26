@@ -157,27 +157,25 @@ void form_bo_video_packet(char* buf, uint fec_group, ushort fec_index, ushort da
     packet->total_packets = total_packets;
 }
 
-void form_bo_video_packet_group(list_t* buf_list, uint* fec_group, int frame_buffer_end) {
-    buf_t *header = list_elt(buf_list->next, buf_t, list);
+void form_bo_video_packet_group(buf_t* frame_buf, uint* fec_group, int frame_buffer_end) {
+    buf_t *header = &frame_buf[0];
     uint timestamp = get_timestamp(header->buf);
     ushort fec_index = 0;
-    for (list_t *elt = buf_list->next; elt != buf_list;) {
-        buf_t *buf_elt = list_elt(elt, buf_t, list);
-        elt = elt->next;
+    for (int idx = 0; idx <= frame_buffer_end; idx++) {
+        buf_t *buf_elt = &frame_buf[idx];
         form_bo_video_packet(buf_elt->buf, *fec_group, fec_index++, frame_buffer_end, frame_buffer_end, timestamp);
     }
     *fec_group = *fec_group + 1;
 }
 
-unsigned char** generate_parity(list_t* buf_list, int frame_buffer_end, int parity_amount) {
-    buf_t *header = list_elt(buf_list->next, buf_t, list);
+unsigned char** generate_parity(buf_t* frame_buf, int frame_buffer_end, int parity_amount) {
+    buf_t *header = &frame_buf[0];
     int lowest_sequence_number = get_sequence_number(header->buf);
     int total_packets = parity_amount + frame_buffer_end;
     unsigned char** packets = malloc(total_packets * (sizeof(unsigned char*)));
     reed_solomon *rs = reed_solomon_new(frame_buffer_end, parity_amount);
-    for (list_t *elt = buf_list->next; elt != buf_list;) {
-        buf_t *buf_elt = list_elt(elt, buf_t, list);
-        elt = elt->next;
+    for (int idx = 0; idx <= frame_buffer_end; idx++) {
+        buf_t *buf_elt = &frame_buf[idx];
         int sequence_num = get_sequence_number(buf_elt->buf);
         int sequence_idx = sequence_num - lowest_sequence_number;
         packets[sequence_idx] = (unsigned char*) buf_elt->buf;
@@ -190,14 +188,13 @@ unsigned char** generate_parity(list_t* buf_list, int frame_buffer_end, int pari
     return packets + frame_buffer_end;
 }
 
-void queue_parity(unsigned char** parity, list_t* buf_list, int total_parity_length, buf_t* frame_buf, int* frame_buffer_end) {
+void queue_parity(unsigned char** parity, int total_parity_length, buf_t* frame_buf, int* frame_buffer_end) {
     for (int i = 0; i < total_parity_length; i++) {
         buf_t parity_packet;
         memcpy(parity_packet.buf, parity[i], 1041);
         parity_packet.n = 1041;
-        *frame_buffer_end = *frame_buffer_end + 1;
         frame_buf[*frame_buffer_end] = parity_packet;
-        list_add_tail(&(frame_buf[*frame_buffer_end].list), buf_list);
+        *frame_buffer_end = *frame_buffer_end + 1;
         free(parity[i]);
     }
 }
@@ -288,40 +285,23 @@ int udp_forward(int video_socket, int audio_socket, int public_video_socket, int
                     enum FuHeader header = get_fu_header_type(&(frame_buffer[frame_buffer_end]));
                     if (header == Start) {
                         frame_buffer_end = 0;
-                        list_new(&frame_buf_list);
-                        list_add_tail(&(frame_buffer[frame_buffer_end].list), &frame_buf_list);
-
                     } else if (header == Middle) {
-                        list_add_tail(&(frame_buffer[frame_buffer_end].list), &frame_buf_list);
                         frame_buffer_end++;
                         if (frame_buffer_end == FRAMEBUFSIFE) {
                             frame_buffer_end = 0;
                         }
-                        if (&(frame_buffer[frame_buffer_end].list) == &frame_buf_list) {
-                            log_debug("reached max list length, prune all members of a list");
-                            list_new(&frame_buf_list);
-                        }
-                    } else {
-                        list_add_tail(&(frame_buffer[frame_buffer_end].list), &frame_buf_list);
+                    } else if (header == End) {
                         frame_buffer_end++;
                         int parity_amount = ((frame_buffer_end + 1) / 10) * 2;
-                        unsigned char** parity_packets = generate_parity(&frame_buf_list, frame_buffer_end, parity_amount);
-                        queue_parity(parity_packets, &frame_buf_list, parity_amount, (buf_t*)&frame_buffer, &frame_buffer_end);
-                        form_bo_video_packet_group(&frame_buf_list, &current_fec_group, frame_buffer_end);
-                        for (list_t *elt = frame_buf_list.next; elt != &frame_buf_list;) {
-                            buf_t *buf_elt = list_elt(elt, buf_t, list);
-                            elt = elt->next;
-                            list_del(&buf_elt->list);
-                            list_add_tail(&buf_elt->list, &buf_list);
-                            buf_slab_end++;
-                            if (buf_slab_end == BUFLISTSIZE) {
-                                buf_slab_end = 0;
-                            }
-                            if (&(buf_slab[buf_slab_end].list) == buf_list.next) {
-                                log_debug("reached max list length, prune all members of a list");
-                                list_new(&buf_list);
-                            }
+                        unsigned char** parity_packets = generate_parity((buf_t*)&frame_buffer, frame_buffer_end, parity_amount);
+                        queue_parity(parity_packets, parity_amount,(buf_t*) &frame_buffer, &frame_buffer_end);
+                        form_bo_video_packet_group((buf_t*)&frame_buffer, &current_fec_group, frame_buffer_end);
+                        for (int idx = 0; idx <= frame_buffer_end; idx++) {
+                            list_add_tail(&(frame_buffer[idx].list), &buf_list);
                         }
+                        frame_buffer_end = 0;
+                    } else {
+                        continue;
                     }
                 }
                 if (tokens > 0) {
